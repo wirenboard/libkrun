@@ -283,6 +283,22 @@ impl Vmm {
                 self.kernel_cmdline.len() + 1
             };
 
+            // x86 Linux statically sizes `boot_command_line[COMMAND_LINE_SIZE]`
+            // (default 2048) and silently truncates anything past that at
+            // setup_arch() time. If we overflow we lose trailing virtio_mmio
+            // device entries and the guest hangs in early boot with no
+            // visible kernel output — warn loudly so the failure mode is
+            // discoverable. agent-vm's libkrunfw is patched to bump
+            // COMMAND_LINE_SIZE to 16384; stock libkrunfw still has 2048.
+            const X86_DEFAULT_COMMAND_LINE_SIZE: usize = 2048;
+            if cmdline_len > X86_DEFAULT_COMMAND_LINE_SIZE {
+                warn!(
+                    "kernel cmdline length {cmdline_len} exceeds stock x86 COMMAND_LINE_SIZE ({X86_DEFAULT_COMMAND_LINE_SIZE}); \
+                     the guest will hang silently in early boot unless libkrunfw was rebuilt with a larger \
+                     COMMAND_LINE_SIZE. Consider fewer virtio devices (--mount entries) or a custom libkrunfw."
+                );
+            }
+
             arch::x86_64::configure_system(
                 &self.guest_memory,
                 &self.arch_memory_info,
