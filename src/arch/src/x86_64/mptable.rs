@@ -13,7 +13,6 @@ use libc::c_char;
 
 use arch_gen::x86::mpspec;
 
-use crate::x86_64::layout::IOAPIC_NUM_PINS;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
@@ -117,12 +116,25 @@ fn mpf_intel_compute_checksum(v: &mpspec::mpf_intel) -> u8 {
     (!checksum).wrapping_add(1)
 }
 
+/// Number of IOAPIC pins we advertise in the MP table as INTSRC entries.
+/// Matches the IOAPIC's hardware pin count exposed via IOAPIC_VER and the
+/// KVM_CAP_SPLIT_IRQCHIP `args[0]` GSI reservation. Linux's MP parser
+/// needs to see an interrupt-source entry for each pin so that
+/// `request_irq()` from virtio-mmio device probes can map the requested
+/// IRQ number to an IOAPIC redirection table entry. Pre-fix we emitted
+/// only 16 entries (the ISA-bus range) and any virtio-mmio device whose
+/// IRQ was allocated above pin 15 failed probe with `-EINVAL` — the
+/// kernel had no mapping for it. Bumped to 24 to match the in-kernel
+/// IOAPIC's pin count, which is what Linux's `kvm_setup_default_irq_routing()`
+/// installs by default and what KVM exposes on the in-kernel-IOAPIC path.
+pub const MP_ISA_INTSRC_COUNT: usize = crate::x86_64::layout::IOAPIC_NUM_PINS;
+
 fn compute_mp_size(num_cpus: u8) -> usize {
     mem::size_of::<MpcTableWrapper>()
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
         + mem::size_of::<MpcBusWrapper>()
-        + mem::size_of::<MpcIntsrcWrapper>() * IOAPIC_NUM_PINS
+        + mem::size_of::<MpcIntsrcWrapper>() * MP_ISA_INTSRC_COUNT
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
@@ -223,7 +235,17 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
         base_mp = base_mp.unchecked_add(size);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
-    for i in 0..IOAPIC_NUM_PINS {
+    // Per kvm_setup_default_irq_routing() in the Linux kernel: emit MP
+    // interrupt-source entries only for the 16 legacy ISA IRQs. The
+    // IOAPIC's full 256-pin table is exposed via the IOAPIC version
+    // register (see `IoApic::read` IO_APIC_VER), and IOAPIC pins beyond
+    // 15 are configured at runtime by drivers writing the redirection
+    // table from their MMIO probe — they don't need MP table entries.
+    // Advertising more than 16 here causes Linux to treat high pins as
+    // overlapping ISA IRQs and silently drop their delivery, which
+    // manifests as a guest boot hang once virtio device count crosses
+    // pin 15.
+    for i in 0..MP_ISA_INTSRC_COUNT {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
@@ -407,22 +429,23 @@ mod tests {
             .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
             .unwrap();
         let mut intsrc_count = 0;
-        let mut found_pin_32 = false;
+        let mut found_last_isa_pin = false;
 
         while entry_offset < mpc_end {
             let entry_type: u8 = mem.read_obj(entry_offset).unwrap();
             if u32::from(entry_type) == mpspec::MP_INTSRC {
                 let intsrc: MpcIntsrcWrapper = mem.read_obj(entry_offset).unwrap();
                 intsrc_count += 1;
-                found_pin_32 |= intsrc.0.srcbusirq == 32 && intsrc.0.dstirq == 32;
+                let last = (MP_ISA_INTSRC_COUNT - 1) as u8;
+                found_last_isa_pin |= intsrc.0.srcbusirq == last && intsrc.0.dstirq == last;
             }
             entry_offset = entry_offset
                 .checked_add(table_entry_size(entry_type) as u64)
                 .unwrap();
         }
 
-        assert_eq!(intsrc_count, IOAPIC_NUM_PINS);
-        assert!(found_pin_32);
+        assert_eq!(intsrc_count, MP_ISA_INTSRC_COUNT);
+        assert!(found_last_isa_pin);
     }
 
     #[test]
