@@ -283,6 +283,27 @@ impl Vmm {
                 self.kernel_cmdline.len() + 1
             };
 
+            // x86 Linux statically sizes `boot_command_line[COMMAND_LINE_SIZE]`
+            // (stock kernels default to 2048) and silently truncates anything
+            // longer at setup_arch() time. If the cmdline overflows the
+            // kernel's compiled-in cap, the trailing virtio_mmio entries are
+            // lost and the guest hangs in early boot with no console output.
+            // We don't know the running kernel's COMMAND_LINE_SIZE from
+            // userspace, so we can only flag when the cmdline crosses the
+            // stock default — distros that ship a kernel with a larger cap
+            // (e.g. libkrunfw rebuilt with COMMAND_LINE_SIZE=16384) will see
+            // this fire harmlessly above 2048.
+            const X86_STOCK_COMMAND_LINE_SIZE: usize = 2048;
+            if cmdline_len > X86_STOCK_COMMAND_LINE_SIZE {
+                warn!(
+                    "kernel cmdline length {cmdline_len} exceeds the stock x86 \
+                     COMMAND_LINE_SIZE ({X86_STOCK_COMMAND_LINE_SIZE}); a kernel \
+                     compiled with the stock cap will silently truncate and hang \
+                     in early boot. Harmless if your libkrunfw was rebuilt with a \
+                     larger COMMAND_LINE_SIZE."
+                );
+            }
+
             arch::x86_64::configure_system(
                 &self.guest_memory,
                 &self.arch_memory_info,

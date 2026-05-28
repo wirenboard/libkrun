@@ -13,7 +13,6 @@ use libc::c_char;
 
 use arch_gen::x86::mpspec;
 
-use crate::x86_64::layout::IOAPIC_NUM_PINS;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
@@ -117,12 +116,27 @@ fn mpf_intel_compute_checksum(v: &mpspec::mpf_intel) -> u8 {
     (!checksum).wrapping_add(1)
 }
 
+/// Number of IOAPIC pins we advertise in the MP table as INTSRC entries.
+/// Set to `IOAPIC_NUM_PINS` (256) so Linux's MP parser sees a mapping
+/// for every pin the userspace IOAPIC exposes — `request_irq()` from a
+/// virtio-mmio probe builds its irq descriptor from a matching INTSRC
+/// entry, and emitting only the legacy 16 ISA entries used to fail
+/// the probe with `-EINVAL` once `virtio_mmio.device=...:N` allocated
+/// pin N > 15. Cap is u8 because `srcbusirq`/`dstirq` in
+/// `mpc_intsrc` are u8; the assert below enforces it.
+pub const MP_ISA_INTSRC_COUNT: usize = crate::x86_64::layout::IOAPIC_NUM_PINS;
+
+const _: () = assert!(
+    MP_ISA_INTSRC_COUNT <= 256,
+    "MP_ISA_INTSRC_COUNT must fit in u8 (mpc_intsrc.srcbusirq/dstirq)"
+);
+
 fn compute_mp_size(num_cpus: u8) -> usize {
     mem::size_of::<MpcTableWrapper>()
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
         + mem::size_of::<MpcBusWrapper>()
-        + mem::size_of::<MpcIntsrcWrapper>() * IOAPIC_NUM_PINS
+        + mem::size_of::<MpcIntsrcWrapper>() * MP_ISA_INTSRC_COUNT
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
@@ -223,7 +237,18 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
         base_mp = base_mp.unchecked_add(size);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
-    for i in 0..IOAPIC_NUM_PINS {
+    // Emit one INTSRC entry per IOAPIC pin so Linux's MP parser builds
+    // a complete srcbusirq → dstirq map. virtio-mmio probes ask for a
+    // specific IRQ via `request_irq(IRQ_BASE+N, ...)`; without a matching
+    // INTSRC entry the kernel has no IOAPIC redirection-table mapping
+    // for that virq and rejects the probe with -EINVAL. Pre-fix we
+    // emitted only the 16 legacy-ISA entries, which is what most VMMs
+    // ship — but that capped the per-VM virtio-mmio device count near
+    // pin 15. Emitting all 256 is safe in this VMM because we set the
+    // KVM_CAP_SPLIT_IRQCHIP GSI reservation to the same 256 in
+    // `IoApic::new` and the userspace IOAPIC handles every pin
+    // uniformly (no ISA-vs-PCI distinction at the chip layer).
+    for i in 0..MP_ISA_INTSRC_COUNT {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
@@ -392,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn intsrc_entries_cover_ioapic_pin_32() {
+    fn intsrc_entries_cover_full_ioapic_pin_range() {
         let num_cpus = 1;
         let mem = mp_table_memory(compute_mp_size(num_cpus));
 
@@ -407,6 +432,8 @@ mod tests {
             .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
             .unwrap();
         let mut intsrc_count = 0;
+        let last_pin = (MP_ISA_INTSRC_COUNT - 1) as u8;
+        let mut found_last_pin = false;
         let mut found_pin_32 = false;
 
         while entry_offset < mpc_end {
@@ -414,15 +441,24 @@ mod tests {
             if u32::from(entry_type) == mpspec::MP_INTSRC {
                 let intsrc: MpcIntsrcWrapper = mem.read_obj(entry_offset).unwrap();
                 intsrc_count += 1;
-                found_pin_32 |= intsrc.0.srcbusirq == 32 && intsrc.0.dstirq == 32;
+                if intsrc.0.srcbusirq == last_pin && intsrc.0.dstirq == last_pin {
+                    found_last_pin = true;
+                }
+                if intsrc.0.srcbusirq == 32 && intsrc.0.dstirq == 32 {
+                    found_pin_32 = true;
+                }
             }
             entry_offset = entry_offset
                 .checked_add(table_entry_size(entry_type) as u64)
                 .unwrap();
         }
 
-        assert_eq!(intsrc_count, IOAPIC_NUM_PINS);
-        assert!(found_pin_32);
+        assert_eq!(intsrc_count, MP_ISA_INTSRC_COUNT);
+        // Anchor pins: an arbitrary mid-range one (32, the first
+        // non-ISA pin) and the last entry. If either is missing the
+        // loop bound or the cast is wrong.
+        assert!(found_pin_32, "INTSRC entry for pin 32 missing");
+        assert!(found_last_pin, "INTSRC entry for pin {last_pin} missing");
     }
 
     #[test]

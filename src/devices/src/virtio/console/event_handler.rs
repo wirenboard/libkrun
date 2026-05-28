@@ -112,14 +112,27 @@ impl Subscriber for Console {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
 
-        let control_rxq = self.queue_events[CONTROL_RXQ_INDEX].as_raw_fd();
-        let control_txq = self.queue_events[CONTROL_TXQ_INDEX].as_raw_fd();
+        // `interest_list()` (below) registers `activate_evt`, `sigwinch_evt`,
+        // and `control.queue_evt()` with epoll the moment the Console
+        // Subscriber is constructed — well before `activate()` populates
+        // `queue_events`. If any of those eventfds fire pre-activation, we
+        // enter this function with `queue_events` still empty
+        // (`Vec::new()`), so indexing `queue_events[CONTROL_RXQ_INDEX]` (2)
+        // or `[CONTROL_TXQ_INDEX]` (3) panics with
+        // `index out of bounds: the len is 0 but the index is 2`.
+        // The `else` arm at the bottom of this function explicitly handles
+        // the spurious-pre-activation case via `warn!()`, but is unreachable
+        // while the indexed reads happen unconditionally up top. Defer them
+        // into the activated branch so we actually hit the warn path.
         let control_rxq_control = self.control.queue_evt().as_raw_fd();
 
         let activate_evt = self.activate_evt.as_raw_fd();
         let sigwinch_evt = self.sigwinch_evt.as_raw_fd();
 
         if self.is_activated() {
+            let control_rxq = self.queue_events[CONTROL_RXQ_INDEX].as_raw_fd();
+            let control_txq = self.queue_events[CONTROL_TXQ_INDEX].as_raw_fd();
+
             let mut raise_irq = false;
 
             if source == control_txq {
@@ -151,6 +164,24 @@ impl Subscriber for Console {
             }
         } else {
             warn!("console: The device is not yet activated. Spurious event received: {source:?}");
+            // Drain whichever pre-activation eventfd fired so epoll
+            // doesn't keep redelivering the same edge in a tight loop.
+            // The Subscriber is registered with three fds via
+            // `interest_list()`: activate_evt, sigwinch_evt, and
+            // control.queue_evt(). The first never legitimately fires
+            // pre-activation (the device's `activate()` writes to it
+            // *after* flipping `device_state` to Activated), so any
+            // pre-activation hit on it is genuinely spurious. The
+            // other two can fire pre-activation if the guest pokes
+            // virtio-console control / SIGWINCH paths during early
+            // probing; we just drain them so epoll quiesces.
+            if source == self.control.queue_evt().as_raw_fd() {
+                let _ = self.control.queue_evt().read();
+            } else if source == self.sigwinch_evt.as_raw_fd() {
+                let _ = self.sigwinch_evt.read();
+            } else if source == self.activate_evt.as_raw_fd() {
+                let _ = self.activate_evt.read();
+            }
         }
     }
 
